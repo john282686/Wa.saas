@@ -10,12 +10,11 @@ const {
   fetchLatestWaWebVersion,
   Browsers,
   generateWAMessageFromContent,
-  prepareWAMessageMedia,
   jidNormalizedUser
-} = require('@rexxhayanasi/elaina-baileys');
+} = require('@zavedyaid/baileys');
 const pino = require('pino');
 const axios = require('axios');
-const sharp = require('sharp');
+const fs = require('fs');
 
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -33,7 +32,7 @@ http.createServer((req, res) => {
   res.end('OK');
 }).listen(PORT, () => console.log(`✅ Health on ${PORT}`));
 
-// ===== MongoDB auth state =====
+// MongoDB auth state
 async function useMongoAuthState(key) {
   const coll = db.collection('sessions');
   const writeData = async (data, id) => {
@@ -86,7 +85,7 @@ async function useMongoAuthState(key) {
   };
 }
 
-// ===== Fetch channel preview =====
+// Fetch preview data
 async function fetchPreview(url) {
   try {
     const res = await axios.get(url, {
@@ -104,7 +103,6 @@ async function fetchPreview(url) {
     if (m) out.description = m[1].replace(/&amp;/g, '&').replace(/&#039;/g, "'");
     m = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
     if (m) out.image = m[1].replace(/&amp;/g, '&');
-
     if (out.image) {
       try {
         const r = await axios.get(out.image, {
@@ -112,43 +110,18 @@ async function fetchPreview(url) {
           timeout: 10000,
           headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-        const originalBuffer = Buffer.from(r.data);
-        // Convert to landscape (16:9) to satisfy status aspect ratio requirement
-        const metadata = await sharp(originalBuffer).metadata();
-        const targetWidth = 640;
-        const targetHeight = Math.round(targetWidth / 1.78); // 16:9 = 1.78 (well above 1.4 min)
-        const padded = await sharp(originalBuffer)
-          .resize({
-            width: Math.round(targetHeight * (metadata.width / metadata.height)),
-            height: targetHeight,
-            fit: 'contain',
-            background: { r: 0, g: 0, b: 0, alpha: 1 }
-          })
-          .extend({
-            top: 0, bottom: 0,
-            left: Math.max(0, Math.round((targetWidth - Math.round(targetHeight * (metadata.width / metadata.height))) / 2)),
-            right: Math.max(0, Math.round((targetWidth - Math.round(targetHeight * (metadata.width / metadata.height))) / 2)),
-            background: { r: 0, g: 0, b: 0, alpha: 1 }
-          })
-          .jpeg({ quality: 90 })
-          .toBuffer();
-        out.thumbBuffer = padded;
-        out.thumbWidth = targetWidth;
-        out.thumbHeight = targetHeight;
-        console.log(`[THUMB] resized to ${targetWidth}x${targetHeight} (ratio ${(targetWidth/targetHeight).toFixed(2)})`);
-      } catch (e) {
-        console.log('Thumb resize failed:', e.message);
-        out.thumbBuffer = null;
-      }
+        out.thumbBuffer = Buffer.from(r.data);
+      } catch (e) {}
     }
     return out;
   } catch (e) { console.log('Preview fetch failed:', e.message); return null; }
 }
 
-// ===== Send group status with preview card =====
+// ===== GROUP STATUS WITH PREVIEW CARD (using native fork support) =====
 async function sendGroupStatusWithCard(groupJid, text, preview) {
   const senderJid = jidNormalizedUser(sock.user?.id);
 
+  // Build contextInfo with externalAdReply (native in @zavedyaid/baileys)
   const contextInfo = {
     forwardingScore: 0,
     featureEligibilities: { canBeReshared: true, canReceiveMultiReact: true },
@@ -159,19 +132,17 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
     statusAudienceMetadata: { audienceType: 1, listEmoji: '', listName: 'Channel Update' }
   };
 
-  // Attach externalAdReply — the preview card
+  // Attach the preview card (native support in this fork)
   if (preview && preview.thumbBuffer) {
     contextInfo.externalAdReply = {
       title: preview.title || 'WhatsApp Channel',
       body: preview.description || 'Tap to view channel',
-      mediaType: 1, // IMAGE — must be 1 for the card to render
+      mediaType: 1,
       thumbnail: preview.thumbBuffer,
-      thumbnailWidth: preview.thumbWidth,
-      thumbnailHeight: preview.thumbHeight,
-      sourceUrl: preview.channelUrl || 'https://whatsapp.com',
-      mediaUrl: preview.channelUrl || 'https://whatsapp.com',
-      renderLargerThumbnail: true,
+      sourceUrl: null,
+      mediaUrl: null,
       showAdAttribution: false,
+      renderLargerThumbnail: true,
       sourceApp: 'whatsapp'
     };
   }
@@ -191,23 +162,19 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
   return generated.key.id;
 }
 
-// ===== Send regular message with preview card =====
-async function sendMessageWithPreview(jid, text, preview) {
+// ===== REGULAR MESSAGE WITH PREVIEW CARD =====
+async function sendMessageWithCard(jid, text, preview) {
   const opts = { text: text };
   if (preview && preview.thumbBuffer) {
-    opts.contextInfo = {
-      externalAdReply: {
-        title: preview.title || 'WhatsApp Channel',
-        body: preview.description || 'Tap to view channel',
-        mediaType: 1,
-        thumbnail: preview.thumbBuffer,
-        thumbnailWidth: preview.thumbWidth,
-        thumbnailHeight: preview.thumbHeight,
-        sourceUrl: preview.channelUrl,
-        mediaUrl: preview.channelUrl,
-        renderLargerThumbnail: true,
-        showAdAttribution: false
-      }
+    opts.externalAdReply = {
+      title: preview.title || 'WhatsApp Channel',
+      body: preview.description || 'Tap to view channel',
+      mediaType: 1,
+      thumbnail: preview.thumbBuffer,
+      sourceUrl: null,
+      mediaUrl: null,
+      showAdAttribution: false,
+      renderLargerThumbnail: true
     };
   }
   await sock.sendMessage(jid, opts);
@@ -248,7 +215,6 @@ async function startBot() {
         console.log('========================================');
         console.log('🔑 PAIRING CODE: ' + code);
         console.log('========================================');
-        console.log('Enter in WhatsApp within 60 seconds.');
         console.log('');
       } catch (e) { console.log('Pair error:', e.message); }
     }, 3000);
@@ -314,22 +280,19 @@ async function startBot() {
             const toAll = mode.includes('all');
             const channelLink = text.match(/(https?:\/\/[^\s]+)/)[0];
 
-            console.log(`[POST] ${mode} — fetching preview for ${channelLink}`);
+            console.log(`[POST] ${mode} — fetching preview`);
             const preview = await fetchPreview(channelLink);
-            if (preview) preview.channelUrl = channelLink;
 
             if (preview && preview.title) {
               console.log(`[PREVIEW] "${preview.title}" thumb=${preview.thumbBuffer ? preview.thumbBuffer.length + 'B' : 'none'}`);
-            } else {
-              console.log('[PREVIEW] failed');
             }
 
             const post = async (jid) => {
               if (isStatus) {
                 await sendGroupStatusWithCard(jid, text, preview);
-                console.log(`  ✓ status posted to ${jid}`);
+                console.log(`  ✓ status with card posted to ${jid}`);
               } else {
-                await sendMessageWithPreview(jid, text, preview);
+                await sendMessageWithCard(jid, text, preview);
                 console.log(`  ✓ message posted to ${jid}`);
               }
             };
