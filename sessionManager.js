@@ -145,6 +145,18 @@ await notifyUser(telegramId,
     console.log(`⚠️ Fake open event for ${telegramId} — auth not registered. Ignoring.`);
     return;
   }
+  if (connection === 'open') {
+  // Detect FAKE open — WhatsApp rejects unregistered sessions with 401
+  if (!sock.user || !sock.user.id) {
+    console.log(`⚠️ Fake connect for ${telegramId} — no user. Closing socket.`);
+    try { sock.end(undefined); } catch (e) {}
+    // Clear stale session from DB and retry fresh
+    const db = getDB();
+    const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
+    for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
+    setTimeout(() => createSession(telegramId, phoneNumber), 3000);
+    return;
+  }
   if (session.hasSentConnectMsg) return;
   session.hasSentConnectMsg = true;
   session.status = 'connected';
