@@ -193,8 +193,18 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
     }
   });
 
-  const awaitingLink = {};
-  const warnings = new Map();
+  // Persistent link queue — survives reconnects
+const linkQueuePath = './linkqueue.json';
+const fs = require('fs');
+function loadQueue() {
+  try { return JSON.parse(fs.readFileSync(linkQueuePath, 'utf8')); }
+  catch (e) { return {}; }
+}
+function saveQueue(q) {
+  try { fs.writeFileSync(linkQueuePath, JSON.stringify(q)); } catch (e) {}
+}
+let awaitingLink = loadQueue();
+const warnings = new Map();
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     try {
@@ -224,8 +234,9 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
           // ---- Owner commands ----
           if (msg.key.fromMe) {
             if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
-              const mode = t.replace('.', '');
-              awaitingLink[from] = mode;
+  const mode = t.replace('.', '');
+  awaitingLink[from] = mode;
+  saveQueue(awaitingLink);
               const hint = t.includes('status') ? 'status' : 'message';
               const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
               console.log(`[CMD] ${mode} triggered in ${from}`);
@@ -239,8 +250,9 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
             }
 
             if (awaitingLink[from]) {
-              const mode = awaitingLink[from];
-              delete awaitingLink[from];
+  const mode = awaitingLink[from];
+  delete awaitingLink[from];
+  saveQueue(awaitingLink);
               const linkMatch = text.match(/(https?:\/\/[^\s]+)/);
               if (!linkMatch) {
                 console.log(`[LINK] No link found in message`);
