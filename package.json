@@ -9,7 +9,8 @@
     "@zavedyaid/baileys": "^1.0.0",
     "axios": "^1.7.7",
     "mongodb": "^6.10.0",
-    "pino": "^9.5.0"
+    "pino": "^9.5.0",
+    "socks-proxy-agent": "^8.0.2"
   },
   "engines": {
     "node": ">=20"
