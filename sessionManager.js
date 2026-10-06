@@ -75,12 +75,13 @@ async function createSession(telegramId, phoneNumber) {
   const protectionEnabled = user ? !!user.protection_enabled : false;
 
   const session = {
-    sock,
-    status: 'pending',
-    phone: phoneNumber,
-    groups: 0,
-    protectionEnabled
-  };
+  sock,
+  status: 'pending',
+  phone: phoneNumber,
+  groups: 0,
+  protectionEnabled,
+  hasSentConnectMsg: false
+};
   activeSessions.set(telegramId, session);
 
   let codeRequested = false;
