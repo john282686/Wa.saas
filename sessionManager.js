@@ -7,6 +7,7 @@ const { getText, detectViolations, isAdminCommand, asksAboutGroup } = require('.
 
 const activeSessions = new Map();
 const adminCache = new Map();
+const pairingCodeSent = new Map(); // telegramId -> true (prevents duplicate codes)
 let notifyUserFn = null;
 
 function setNotifier(fn) { notifyUserFn = fn; }
@@ -72,19 +73,16 @@ async function createSession(telegramId, phoneNumber) {
     phone: phoneNumber,
     groups: 0,
     protectionEnabled,
-    hasSentConnectMsg: false,
-    phoneForReconnect: phoneNumber
+    hasSentConnectMsg: false
   };
   activeSessions.set(telegramId, session);
-
-  let codeRequested = false;
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ---- Only request code when QR fires AND not registered ----
-    if (qr && !sock.authState.creds.registered && !codeRequested) {
-      codeRequested = true;
+    // ---- Request code ONLY ONCE per /pair ----
+    if (qr && !sock.authState.creds.registered && !pairingCodeSent.get(telegramId)) {
+      pairingCodeSent.set(telegramId, true);
       try {
         const code = await sock.requestPairingCode(phoneNumber);
         console.log(`🔑 Pair code for ${telegramId}: ${code}`);
@@ -109,7 +107,6 @@ async function createSession(telegramId, phoneNumber) {
       if (!sock.user || !sock.user.id) {
         console.log(`⚠️ Fake connect for ${telegramId} — no user. Closing.`);
         try { sock.end(undefined); } catch (e) {}
-        // Wipe stale session from DB
         try {
           const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
           for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
@@ -143,21 +140,21 @@ async function createSession(telegramId, phoneNumber) {
         { upsert: true }
       );
 
-      // Send commands to WhatsApp self-chat
+      // Send commands to user's WhatsApp self-chat
       try {
         const selfJid = session.ownerNumber + '@s.whatsapp.net';
         await sock.sendMessage(selfJid, {
           text:
             `🤖 *WhatsApp Guardian Bot — Commands*\n\n` +
-            `*Owner commands (in any group you admin):*\n` +
+            `*Owner commands (type in any group you admin):*\n` +
             `.send — Post to this group\n` +
             `.sendall — Post to ALL your groups\n` +
-            `.status — Status in this group\n` +
-            `.statusall — Status in ALL groups\n\n` +
+            `.status — Post as status in this group\n` +
+            `.statusall — Post as status in ALL groups\n\n` +
             `*Auto protection (turn on in Telegram):*\n` +
             `🚫 Links, phone numbers, invites, forwards, contacts\n` +
-            `⚠️ 3 warnings → removal\n` +
-            `✅ Admins exempt`
+            `⚠️ 3 warnings → user removed\n` +
+            `✅ Admins are exempt`
         });
       } catch (e) { console.log('Self-chat send failed:', e.message); }
 
@@ -184,7 +181,6 @@ async function createSession(telegramId, phoneNumber) {
         );
         await notifyUser(telegramId, '⚠️ WhatsApp disconnected. Use /pair to link again.');
       } else if (code === 401) {
-        // Auth failed — wipe and stop looping
         console.log(`401 auth failed for ${telegramId}. Wiping session.`);
         session.status = 'logged_out';
         activeSessions.delete(telegramId);
@@ -222,7 +218,6 @@ async function createSession(telegramId, phoneNumber) {
     const senderJid = msg.key.participant || msg.key.remoteJid;
     const senderNum = senderJid.split('@')[0].split(':')[0];
 
-    // Owner commands
     if (msg.key.fromMe) {
       if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
         const mode = t.replace('.', '');
@@ -232,7 +227,6 @@ async function createSession(telegramId, phoneNumber) {
         await sock.sendMessage(from, { text: `Send your channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
         return;
       }
-      // Handle link reply
       if (awaitingLink[from]) {
         const mode = awaitingLink[from];
         delete awaitingLink[from];
@@ -269,7 +263,6 @@ async function createSession(telegramId, phoneNumber) {
       return;
     }
 
-    // Non-owner checks
     if (isAdminCommand(t)) {
       const isAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
       if (!isAdmin) {
@@ -331,6 +324,11 @@ function setProtection(telegramId, enabled) {
   if (s) s.protectionEnabled = !!enabled;
 }
 
+function resetPairingCode(telegramId) {
+  pairingCodeSent.delete(telegramId);
+  console.log(`Pairing code reset for ${telegramId}`);
+}
+
 async function restoreAllSessions() {
   try {
     const users = await getDB().collection('users')
@@ -347,5 +345,5 @@ async function restoreAllSessions() {
 
 module.exports = {
   createSession, removeSession, getSession,
-  restoreAllSessions, setNotifier, setProtection
+  restoreAllSessions, setNotifier, setProtection, resetPairingCode
 };
