@@ -1,4 +1,4 @@
-// index.js — WhatsApp bot with status + card
+// index.js — WhatsApp Bot for Render
 const http = require('http');
 const { MongoClient } = require('mongodb');
 const {
@@ -16,7 +16,8 @@ const pino = require('pino');
 const axios = require('axios');
 
 const PORT = process.env.PORT || 10000;
-const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_URI = 'mongodb+srv://jameswilson28699_db_user:1EOQXocsj5qeIGfG@cluster0.anjeyqz.mongodb.net/?appName=Cluster0';
+const PROXY_URL = null;
 const OWNER_NUMBER = '233206391674';
 const DB_NAME = 'wa_saas';
 const SESSION_KEY = 'user_8629374120';
@@ -31,7 +32,6 @@ http.createServer((req, res) => {
   res.end('OK');
 }).listen(PORT, () => console.log(`✅ Health on ${PORT}`));
 
-// MongoDB auth state
 async function useMongoAuthState(key) {
   const coll = db.collection('sessions');
   const writeData = async (data, id) => {
@@ -84,7 +84,6 @@ async function useMongoAuthState(key) {
   };
 }
 
-// Fetch preview data
 async function fetchPreview(url) {
   try {
     const res = await axios.get(url, {
@@ -116,10 +115,8 @@ async function fetchPreview(url) {
   } catch (e) { console.log('Preview fetch failed:', e.message); return null; }
 }
 
-// GROUP STATUS WITH PREVIEW CARD
 async function sendGroupStatusWithCard(groupJid, text, preview) {
   const senderJid = jidNormalizedUser(sock.user?.id);
-
   const contextInfo = {
     forwardingScore: 0,
     featureEligibilities: { canBeReshared: true, canReceiveMultiReact: true },
@@ -129,7 +126,6 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
     statusAttributions: [{ type: 6, groupStatus: { authorJid: senderJid } }],
     statusAudienceMetadata: { audienceType: 1, listEmoji: '', listName: 'Channel Update' }
   };
-
   if (preview && preview.thumbBuffer) {
     contextInfo.externalAdReply = {
       title: preview.title || 'WhatsApp Channel',
@@ -143,7 +139,6 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
       sourceApp: 'whatsapp'
     };
   }
-
   const innerContent = {
     extendedTextMessage: {
       text: text,
@@ -152,14 +147,12 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
       contextInfo: contextInfo
     }
   };
-
   const messageContent = { groupStatusMessageV2: { message: innerContent } };
   const generated = generateWAMessageFromContent(groupJid, messageContent, { userJid: senderJid });
   await sock.relayMessage(groupJid, generated.message, { messageId: generated.key.id });
   return generated.key.id;
 }
 
-// REGULAR MESSAGE WITH PREVIEW CARD
 async function sendMessageWithCard(jid, text, preview) {
   const opts = { text: text };
   if (preview && preview.thumbBuffer) {
@@ -191,7 +184,7 @@ async function startBot() {
   console.log('WA version:', version.join('.'));
   console.log('Registered:', state.creds.registered);
 
-  sock = makeWASocket({
+  const socketOptions = {
     version,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -199,8 +192,15 @@ async function startBot() {
     browser: Browsers.macOS('Chrome'),
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true
-  });
+  };
 
+  if (PROXY_URL) {
+    console.log('Using proxy:', PROXY_URL);
+    const { SocksProxyAgent } = require('socks-proxy-agent');
+    socketOptions.agent = new SocksProxyAgent(PROXY_URL);
+  }
+
+  sock = makeWASocket(socketOptions);
   sock.ev.on('creds.update', saveCreds);
 
   if (!state.creds.registered) {
@@ -233,7 +233,6 @@ async function startBot() {
     try {
       if (!messages || !messages.length) return;
       if (type !== 'notify' && type !== 'append') return;
-
       for (const msg of messages) {
         try {
           if (!msg || !msg.message) continue;
@@ -242,7 +241,6 @@ async function startBot() {
           if (from.endsWith('@newsletter') || from.endsWith('@broadcast')) continue;
           if (!from.endsWith('@g.us')) continue;
           if (!msg.key.fromMe) continue;
-
           const msgAge = Date.now() / 1000 - (msg.messageTimestamp || 0);
           if (msgAge > 30) continue;
           if (processedIds.has(msg.key.id)) continue;
@@ -252,13 +250,10 @@ async function startBot() {
             processedIds.clear();
             arr.slice(-250).forEach(id => processedIds.add(id));
           }
-
           const text = msg.message.conversation ||
             (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '';
           const t = text.trim().toLowerCase();
-
           console.log(`[MSG] ${from} "${text.substring(0, 50)}"`);
-
           if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
             awaitingLink[from] = t.replace('.', '');
             const hint = t.includes('status') ? 'status' : 'message';
@@ -266,24 +261,19 @@ async function startBot() {
             await sock.sendMessage(from, { text: `Send your message with the channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
             continue;
           }
-
           if (awaitingLink[from]) {
             const hasLink = /(https?:\/\/[^\s]+)/i.test(text);
             if (!hasLink) continue;
-
             const mode = awaitingLink[from];
             delete awaitingLink[from];
             const isStatus = mode.includes('status');
             const toAll = mode.includes('all');
             const channelLink = text.match(/(https?:\/\/[^\s]+)/)[0];
-
             console.log(`[POST] ${mode} — fetching preview`);
             const preview = await fetchPreview(channelLink);
-
             if (preview && preview.title) {
               console.log(`[PREVIEW] "${preview.title}" thumb=${preview.thumbBuffer ? preview.thumbBuffer.length + 'B' : 'none'}`);
             }
-
             const post = async (jid) => {
               if (isStatus) {
                 await sendGroupStatusWithCard(jid, text, preview);
@@ -293,7 +283,6 @@ async function startBot() {
                 console.log(`  ✓ message posted to ${jid}`);
               }
             };
-
             if (toAll) {
               const groups = await sock.groupFetchAllParticipating();
               const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
