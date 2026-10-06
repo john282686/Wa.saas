@@ -1,5 +1,5 @@
 // sessionManager.js
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestWaWebVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { getDB } = require('./db');
 const { useMongoAuthState } = require('./authState');
@@ -7,7 +7,7 @@ const { getText, detectViolations, isAdminCommand, asksAboutGroup } = require('.
 
 const activeSessions = new Map();
 const adminCache = new Map();
-const pairingCodeSent = new Map(); // telegramId -> true (prevents duplicate codes)
+const pairingCodeSent = new Map();
 let notifyUserFn = null;
 
 function setNotifier(fn) { notifyUserFn = fn; }
@@ -49,14 +49,25 @@ async function createSession(telegramId, phoneNumber) {
   await removeSession(telegramId);
 
   const { state, saveCreds } = await useMongoAuthState(telegramId);
-  const { version } = await fetchLatestBaileysVersion();
+
+  // FIX 1: Use fetchLatestWaWebVersion (fetchLatestBaileysVersion returns a stale version)
+  let version;
+  try {
+    const r = await fetchLatestWaWebVersion();
+    version = r.version;
+    console.log(`Using WA Web version: ${version.join('.')}`);
+  } catch (e) {
+    console.log('fetchLatestWaWebVersion failed, using fallback');
+    version = [2, 3000, 1035194821];
+  }
 
   const sock = makeWASocket({
     version,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
-    browser: Browsers.ubuntu('Chrome'),
+    // FIX 2: Use canonical macOS Chrome (Ubuntu is rejected for phone pairing)
+    browser: Browsers.macOS('Chrome'),
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true
   });
@@ -80,7 +91,7 @@ async function createSession(telegramId, phoneNumber) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // ---- Request code ONLY ONCE per /pair ----
+    // Request code ONLY ONCE per /pair
     if (qr && !sock.authState.creds.registered && !pairingCodeSent.get(telegramId)) {
       pairingCodeSent.set(telegramId, true);
       try {
@@ -103,7 +114,7 @@ async function createSession(telegramId, phoneNumber) {
     if (connection === 'connecting') session.status = 'connecting';
 
     if (connection === 'open') {
-      // ---- Reject FAKE connections ----
+      // Reject fake connections
       if (!sock.user || !sock.user.id) {
         console.log(`⚠️ Fake connect for ${telegramId} — no user. Closing.`);
         try { sock.end(undefined); } catch (e) {}
