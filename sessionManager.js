@@ -1,10 +1,13 @@
+// sessionManager.js
 const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const axios = require('axios');
 const { getDB } = require('./db');
 const { useMongoAuthState } = require('./authState');
+const { getText, detectViolations, isAdminCommand, asksAboutGroup } = require('./groupProtection');
 
 const activeSessions = new Map();
+const adminCache = new Map(); // key: `${telegramId}-${groupJid}` → { admins, ts }
 let notifyUserFn = null;
 
 function setNotifier(fn) { notifyUserFn = fn; }
@@ -16,6 +19,38 @@ async function notifyUser(telegramId, message, extra = {}) {
   }
 }
 
+// ================ ADMIN CHECK (cached 5 min) ================
+async function getGroupAdmins(sock, telegramId, groupJid) {
+  const key = `${telegramId}-${groupJid}`;
+  const cached = adminCache.get(key);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) {
+    return cached.admins;
+  }
+  try {
+    const meta = await sock.groupMetadata(groupJid);
+    const admins = meta.participants
+      .filter(p => p.admin === 'admin' || p.admin === 'superadmin')
+      .map(p => p.id.split('@')[0].split(':')[0]);
+    adminCache.set(key, { admins, ts: Date.now() });
+    return admins;
+  } catch (e) {
+    return [];
+  }
+}
+
+async function isParticipantAdmin(sock, telegramId, groupJid, participantJid) {
+  if (!participantJid) return false;
+  const num = participantJid.split('@')[0].split(':')[0];
+  const admins = await getGroupAdmins(sock, telegramId, groupJid);
+  return admins.includes(num);
+}
+
+async function isOwnerAdmin(sock, telegramId, groupJid, ownerNumber) {
+  const admins = await getGroupAdmins(sock, telegramId, groupJid);
+  return admins.includes(String(ownerNumber).replace(/\D/g, ''));
+}
+
+// ================ CREATE SESSION ================
 async function createSession(telegramId, phoneNumber) {
   await removeSession(telegramId);
 
@@ -34,11 +69,23 @@ async function createSession(telegramId, phoneNumber) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  const session = { sock, status: 'pending', phone: phoneNumber, groups: 0 };
+  // Load user settings from DB
+  const db = getDB();
+  let user = await db.collection('users').findOne({ telegram_id: telegramId });
+  const protectionEnabled = user ? !!user.protection_enabled : false;
+
+  const session = {
+    sock,
+    status: 'pending',
+    phone: phoneNumber,
+    groups: 0,
+    protectionEnabled
+  };
   activeSessions.set(telegramId, session);
 
   let codeRequested = false;
 
+  // ================ CONNECTION EVENTS ================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -46,18 +93,18 @@ async function createSession(telegramId, phoneNumber) {
       codeRequested = true;
       try {
         const code = await sock.requestPairingCode(phoneNumber);
-        console.log(`Pairing code for ${telegramId}: ${code}`);
+        console.log(`Pair code for ${telegramId}: ${code}`);
         await notifyUser(telegramId,
           `🔑 *Your Pairing Code:* \`${code}\`\n\n` +
           `1. Open WhatsApp\n` +
           `2. Settings → Linked Devices\n` +
           `3. Link a Device → Link with phone number instead\n` +
-          `4. Enter the code above (works only for 60 seconds)`,
+          `4. Enter this code (valid 60 seconds only)`,
           { parse_mode: 'Markdown' }
         );
       } catch (e) {
-        console.log(`Pair code err for ${telegramId}: ${e.message}`);
-        await notifyUser(telegramId, `❌ Failed to get pairing code: ${e.message}`);
+        console.log(`Pair err ${telegramId}: ${e.message}`);
+        await notifyUser(telegramId, `❌ Pairing failed: ${e.message}`);
       }
     }
 
@@ -65,33 +112,50 @@ async function createSession(telegramId, phoneNumber) {
 
     if (connection === 'open') {
       session.status = 'connected';
-      console.log(`✅ Session open for ${telegramId}`);
+      session.ownerNumber = String(phoneNumber).replace(/\D/g, '');
+      console.log(`✅ Connected: ${telegramId} (${session.ownerNumber})`);
+
       try {
         const groups = await sock.groupFetchAllParticipating();
         session.groups = Object.keys(groups).length;
       } catch (e) {}
 
-      await getDB().collection('users').updateOne(
+      await db.collection('users').updateOne(
         { telegram_id: telegramId },
-        { $set: { telegram_id: telegramId, phone_number: phoneNumber, status: 'connected', last_active: new Date(), groups_count: session.groups } },
+        {
+          $set: {
+            telegram_id: telegramId,
+            phone_number: phoneNumber,
+            status: 'connected',
+            last_active: new Date(),
+            groups_count: session.groups
+          }
+        },
         { upsert: true }
       );
 
-      await notifyUser(telegramId, `✅ *WhatsApp connected!*\n\nGroups: ${session.groups}\n\nUse /dashboard to control your bot.`, { parse_mode: 'Markdown' });
+      await notifyUser(telegramId,
+        `✅ *WhatsApp connected!*\n\n` +
+        `📱 Phone: ${phoneNumber}\n` +
+        `👥 Groups: ${session.groups}\n` +
+        `🛡️ Protection: ${session.protectionEnabled ? 'ON' : 'OFF'}\n\n` +
+        `Send /commands to see all commands.`,
+        { parse_mode: 'Markdown' }
+      );
     }
 
     if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log(`Session closed for ${telegramId}. Code: ${code}`);
+      const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
+        ? lastDisconnect.error.output.statusCode : 0;
+      console.log(`Session closed ${telegramId}. Code: ${code}`);
 
       if (code === DisconnectReason.loggedOut) {
         session.status = 'logged_out';
         activeSessions.delete(telegramId);
-        await getDB().collection('users').updateOne(
-          { telegram_id: telegramId },
-          { $set: { status: 'logged_out' } }
+        await db.collection('users').updateOne(
+          { telegram_id: telegramId }, { $set: { status: 'logged_out' } }
         );
-        await notifyUser(telegramId, '⚠️ WhatsApp disconnected. Use /pair to link again.');
+        await notifyUser(telegramId, '⚠️ WhatsApp disconnected. Send /pair to link again.');
       } else {
         session.status = 'reconnecting';
         setTimeout(() => {
@@ -102,9 +166,153 @@ async function createSession(telegramId, phoneNumber) {
     }
   });
 
+  // ================ MESSAGE HANDLER ================
+  const awaitingLink = {};
+  const warnings = new Map(); // `${groupJid}-${userJid}` → count
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message) return;
+
+    const from = msg.key.remoteJid;
+
+    // NEVER touch channels or broadcasts
+    if (from.endsWith('@newsletter')) return;
+    if (from.endsWith('@broadcast')) return;
+
+    // Only handle groups
+    if (!from.endsWith('@g.us')) return;
+
+    const text = getText(msg);
+    const t = text.trim().toLowerCase();
+    const senderJid = msg.key.participant || msg.key.remoteJid;
+    const senderNum = senderJid.split('@')[0].split(':')[0];
+
+    // ---- Owner commands (.send, .sendall, .status, .statusall) ----
+    if (msg.key.fromMe) {
+      if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
+        const mode = t.replace('.', '');
+        awaitingLink[from] = mode;
+        const hint = t.includes('status') ? 'status' : 'message';
+        const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
+        await sock.sendMessage(from, { text: `Send your channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
+        return;
+      }
+      return; // ignore everything else from owner
+    }
+
+    // ---- Non-owner: check for admin command ----
+    if (isAdminCommand(t)) {
+      const isAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
+      if (!isAdmin) {
+        await sock.sendMessage(from, { text: '❌ This command is for the admin.' }, { quoted: msg });
+        return;
+      }
+      // If admin, ignore here (future: implement admin commands)
+      return;
+    }
+
+    // ---- Handle "what is this group for" ----
+    if (asksAboutGroup(text)) {
+      await sock.sendMessage(from, { text: '📖 Please read the group description.' }, { quoted: msg });
+      return;
+    }
+
+    // ---- Protection checks (only if enabled AND owner is admin) ----
+    if (session.protectionEnabled && session.ownerNumber) {
+      const ownerAdmin = await isOwnerAdmin(sock, telegramId, from, session.ownerNumber);
+      if (!ownerAdmin) return; // owner not admin here → skip protection
+
+      const senderAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
+      if (senderAdmin) return; // admins exempt
+
+      const violations = detectViolations(msg);
+      if (violations.length > 0) {
+        // Delete the violating message
+        try { await sock.sendMessage(from, { delete: msg.key }); } catch (e) {}
+
+        const wkey = `${from}-${senderJid}`;
+        const count = (warnings.get(wkey) || 0) + 1;
+        warnings.set(wkey, count);
+
+        if (count >= 3) {
+          try {
+            await sock.groupParticipantsUpdate(from, [senderJid], 'remove');
+            await sock.sendMessage(from, { text: `🚫 @${senderNum} has been removed after 3 warnings.`, mentions: [senderJid] });
+            warnings.delete(wkey);
+          } catch (e) {
+            await sock.sendMessage(from, { text: `⚠️ Warning 3/3 for @${senderNum} (could not remove).`, mentions: [senderJid] });
+          }
+        } else {
+          const reason = violations.join(', ');
+          await sock.sendMessage(from, { text: `⚠️ @${senderNum} Warning ${count}/3 — ${reason} not allowed.`, mentions: [senderJid] }, { quoted: msg });
+        }
+      }
+    }
+
+    // ---- Handle incoming link when awaiting ----
+    if (awaitingLink[from]) {
+      // Only owner can trigger (checked above with fromMe)
+      // This block only runs if fromMe was true and awaitingLink set
+      // (Actually fromMe returns early, so this section is unreachable here)
+    }
+  });
+
+  // ---- Owner message handler (still needs to process the link after .send) ----
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    const msg = messages[0];
+    if (!msg.message) return;
+    if (!msg.key.fromMe) return;
+
+    const from = msg.key.remoteJid;
+    if (!from.endsWith('@g.us')) return;
+    if (!awaitingLink[from]) return;
+
+    const mode = awaitingLink[from];
+    delete awaitingLink[from];
+
+    const text = getText(msg);
+    const linkMatch = text.match(/(https?:\/\/[^\s]+)/);
+    if (!linkMatch) return;
+    const channelLink = linkMatch[0];
+    const extraText = text.replace(channelLink, '').trim();
+    const finalText = extraText ? extraText + '\n' + channelLink : channelLink;
+
+    const isStatus = mode.includes('status');
+    const toAll = mode.includes('all');
+
+    async function post(jid) {
+      const opts = { text: finalText };
+      if (isStatus) opts.groupStatus = true;
+      await sock.sendMessage(jid, opts);
+    }
+
+    if (toAll) {
+      const groups = await sock.groupFetchAllParticipating();
+      const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
+      await sock.sendMessage(from, { text: `📤 Posting to ${ids.length} groups...` });
+      let s = 0, f = 0;
+      for (const g of ids) {
+        try { await post(g); s++; } catch (e) { f++; }
+        await new Promise(r => setTimeout(r, 8000));
+      }
+      await sock.sendMessage(from, { text: `✅ Done. Success: ${s}, Failed: ${f}` });
+    } else {
+      try {
+        await post(from);
+        await sock.sendMessage(from, { text: '✅ Posted!' });
+      } catch (e) {
+        await sock.sendMessage(from, { text: '❌ Failed: ' + e.message });
+      }
+    }
+  });
+
   return sock;
 }
 
+// ================ HELPERS ================
 async function removeSession(telegramId) {
   const existing = activeSessions.get(telegramId);
   if (existing && existing.sock) {
@@ -113,112 +321,33 @@ async function removeSession(telegramId) {
   activeSessions.delete(telegramId);
   try {
     const coll = getDB().collection('sessions');
-    const cursor = coll.find({ _id: { $regex: `^user_${telegramId}-` } });
-    const docs = await cursor.toArray();
+    const docs = await coll.find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
     for (const d of docs) await coll.deleteOne({ _id: d._id });
   } catch (e) {}
 }
 
 function getSession(telegramId) { return activeSessions.get(telegramId); }
 
+function setProtection(telegramId, enabled) {
+  const s = activeSessions.get(telegramId);
+  if (s) s.protectionEnabled = !!enabled;
+}
+
 async function restoreAllSessions() {
   try {
-    const users = await getDB().collection('users').find({ status: { $in: ['connected', 'reconnecting'] } }).toArray();
+    const users = await getDB().collection('users')
+      .find({ status: { $in: ['connected', 'reconnecting'] } }).toArray();
     console.log(`Restoring ${users.length} session(s)...`);
     for (const user of users) {
       try {
         await createSession(user.telegram_id, user.phone_number);
         await new Promise(r => setTimeout(r, 3000));
-      } catch (e) { console.log(`Failed to restore ${user.telegram_id}: ${e.message}`); }
+      } catch (e) { console.log(`Restore fail ${user.telegram_id}: ${e.message}`); }
     }
-  } catch (e) { console.log('Restore failed:', e.message); }
-}
-
-function extractChannelLink(text) {
-  const m = text.match(/(https?:\/\/)?(whatsapp\.com|chat\.whatsapp\.com|wa\.me)\/[^\s]+/i);
-  if (!m) return null;
-  return m[0].startsWith('http') ? m[0] : 'https://' + m[0];
-}
-
-async function fetchChannelPreview(url) {
-  try {
-    const res = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      },
-      timeout: 20000
-    });
-    const html = res.data;
-    const out = {};
-    let m = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
-    if (m) out.title = m[1].replace(/&amp;/g, '&').replace(/&#039;/g, "'").replace(/&quot;/g, '"');
-    m = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
-    if (m) out.description = m[1].replace(/&amp;/g, '&').replace(/&#039;/g, "'").replace(/&quot;/g, '"');
-    m = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
-    if (m) out.image = m[1].replace(/&amp;/g, '&');
-    return out;
-  } catch (e) { console.log('Preview failed:', e.message); return null; }
-}
-
-async function preparePreview(channelLink) {
-  const data = await fetchChannelPreview(channelLink);
-  if (!data || !data.title) return null;
-  let thumb = null;
-  if (data.image) {
-    try {
-      const r = await axios.get(data.image, { responseType: 'arraybuffer', timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-      thumb = Buffer.from(r.data);
-    } catch (e) {}
-  }
-  return { title: data.title, description: data.description || '', thumb };
-}
-
-async function broadcastToAll(telegramId, messageText, asStatus = false) {
-  const session = activeSessions.get(telegramId);
-  if (!session || session.status !== 'connected') {
-    return { success: 0, failed: 0, total: 0, error: 'Session not connected' };
-  }
-  const sock = session.sock;
-  const channelLink = extractChannelLink(messageText);
-  const preview = channelLink ? await preparePreview(channelLink) : null;
-
-  const groups = await sock.groupFetchAllParticipating();
-  const groupIds = Object.keys(groups);
-  let success = 0, failed = 0;
-
-  for (const gid of groupIds) {
-    try {
-      const opts = { text: messageText };
-      if (asStatus) opts.groupStatus = true;
-      if (preview && preview.thumb) {
-        opts.contextInfo = {
-          externalAdReply: {
-            title: preview.title,
-            body: preview.description || 'Tap to view channel',
-            mediaType: 1,
-            thumbnail: preview.thumb,
-            sourceUrl: channelLink,
-            mediaUrl: channelLink,
-            showAdAttribution: false
-          }
-        };
-      }
-      await sock.sendMessage(gid, opts);
-      success++;
-    } catch (e) { failed++; }
-    await new Promise(r => setTimeout(r, 8000));
-  }
-
-  await getDB().collection('users').updateOne(
-    { telegram_id: telegramId },
-    { $inc: { broadcasts_count: 1 }, $set: { last_active: new Date() } }
-  );
-
-  return { success, failed, total: groupIds.length };
+  } catch (e) { console.log('Restore error:', e.message); }
 }
 
 module.exports = {
   createSession, removeSession, getSession,
-  restoreAllSessions, setNotifier, broadcastToAll
+  restoreAllSessions, setNotifier, setProtection
 };
