@@ -9,7 +9,7 @@ async function connectDB() {
   if (!uri) throw new Error('MONGODB_URI not set');
   client = new MongoClient(uri);
   await client.connect();
-  db = client.db('wa_saas_v2');
+  db = client.db('wa_saas');
   console.log('✅ MongoDB connected');
   return db;
 }
