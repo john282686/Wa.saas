@@ -1,6 +1,6 @@
 // telegramBot.js
 const { Telegraf, Markup } = require('telegraf');
-const { createSession, removeSession, getSession, setNotifier, setProtection } = require('./sessionManager');
+const { createSession, removeSession, getSession, setNotifier, setProtection, resetPairingCode } = require('./sessionManager');
 const { getDB } = require('./db');
 
 const userState = new Map();
@@ -38,6 +38,7 @@ function startTelegramBot() {
     if (existing && existing.status === 'connected') {
       return ctx.reply('⚠️ WhatsApp already linked. Send /unpair first to link a different number.');
     }
+    resetPairingCode(telegramId);
     userState.set(telegramId, { action: 'awaiting_number' });
     ctx.reply('📱 Send your WhatsApp number with country code (digits only).\n\nExample: `233XXXXXXXXX`', { parse_mode: 'Markdown' });
   });
@@ -72,7 +73,7 @@ function startTelegramBot() {
     await getDB().collection('users').updateOne(
       { telegram_id: ctx.from.id }, { $set: { protection_enabled: true } }
     );
-    ctx.reply('🛡️ Protection *ON*.\n\nYour groups will now be guarded where you are admin.', { parse_mode: 'Markdown' });
+    ctx.reply('🛡️ Protection *ON*.\n\nYour groups will be guarded where you are admin.', { parse_mode: 'Markdown' });
   });
 
   bot.hears('🛑 Protect OFF', async (ctx) => {
@@ -113,8 +114,8 @@ function startTelegramBot() {
     );
   });
 
-  // Old command-style inputs (still work)
   bot.command('pair', (ctx) => {
+    resetPairingCode(ctx.from.id);
     userState.set(ctx.from.id, { action: 'awaiting_number' });
     ctx.reply('📱 Send your WhatsApp number with country code (digits only).\n\nExample: `233XXXXXXXXX`', { parse_mode: 'Markdown' });
   });
