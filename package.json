@@ -6,9 +6,11 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@rexxhayanasi/elaina-baileys": "^1.4.2",
+    "axios": "^1.7.7",
     "mongodb": "^6.10.0",
-    "pino": "^9.5.0"
+    "pino": "^9.5.0",
+    "sharp": "^0.33.5"
   },
   "engines": {
     "node": ">=20"
