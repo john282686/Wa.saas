@@ -45,8 +45,10 @@ async function isOwnerAdmin(sock, telegramId, groupJid, ownerNumber) {
   return admins.includes(String(ownerNumber).replace(/\D/g, ''));
 }
 
-async function createSession(telegramId, phoneNumber) {
-  await removeSession(telegramId);
+async function createSession(telegramId, phoneNumber, skipWipe = false) {
+  if (!skipWipe) {
+    await removeSession(telegramId);
+                             }
 
   const { state, saveCreds } = await useMongoAuthState(telegramId);
 
@@ -347,7 +349,7 @@ async function restoreAllSessions() {
     console.log(`Restoring ${users.length} session(s)...`);
     for (const user of users) {
       try {
-        await createSession(user.telegram_id, user.phone_number);
+        await createSession(user.telegram_id, user.phone_number, true);
         await new Promise(r => setTimeout(r, 3000));
       } catch (e) { console.log(`Restore fail ${user.telegram_id}: ${e.message}`); }
     }
