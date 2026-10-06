@@ -1,5 +1,5 @@
 // sessionManager.js
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion, Browsers } = require('stian-baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { getDB } = require('./db');
 // ... (keep your auth state and admin check functions) ...
