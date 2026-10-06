@@ -1,4 +1,4 @@
-// index.js — WhatsApp bot with group status + preview card
+// index.js — WhatsApp bot with status + card
 const http = require('http');
 const { MongoClient } = require('mongodb');
 const {
@@ -14,13 +14,12 @@ const {
 } = require('@zavedyaid/baileys');
 const pino = require('pino');
 const axios = require('axios');
-const fs = require('fs');
 
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
-const SESSION_KEY = 'user_8629374120';
+const OWNER_NUMBER = '233206391674';
 const DB_NAME = 'wa_saas';
-const SESSION_KEY = 'owner';
+const SESSION_KEY = 'user_8629374120';
 
 let db;
 let sock;
@@ -117,11 +116,10 @@ async function fetchPreview(url) {
   } catch (e) { console.log('Preview fetch failed:', e.message); return null; }
 }
 
-// ===== GROUP STATUS WITH PREVIEW CARD (using native fork support) =====
+// GROUP STATUS WITH PREVIEW CARD
 async function sendGroupStatusWithCard(groupJid, text, preview) {
   const senderJid = jidNormalizedUser(sock.user?.id);
 
-  // Build contextInfo with externalAdReply (native in @zavedyaid/baileys)
   const contextInfo = {
     forwardingScore: 0,
     featureEligibilities: { canBeReshared: true, canReceiveMultiReact: true },
@@ -132,7 +130,6 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
     statusAudienceMetadata: { audienceType: 1, listEmoji: '', listName: 'Channel Update' }
   };
 
-  // Attach the preview card (native support in this fork)
   if (preview && preview.thumbBuffer) {
     contextInfo.externalAdReply = {
       title: preview.title || 'WhatsApp Channel',
@@ -162,7 +159,7 @@ async function sendGroupStatusWithCard(groupJid, text, preview) {
   return generated.key.id;
 }
 
-// ===== REGULAR MESSAGE WITH PREVIEW CARD =====
+// REGULAR MESSAGE WITH PREVIEW CARD
 async function sendMessageWithCard(jid, text, preview) {
   const opts = { text: text };
   if (preview && preview.thumbBuffer) {
