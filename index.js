@@ -1,16 +1,21 @@
-// index.js — Simple WhatsApp bot with 4 commands
+// index.js — WhatsApp bot with group status + preview card
 const http = require('http');
 const { MongoClient } = require('mongodb');
 const {
   default: makeWASocket,
+  initAuthCreds,
+  BufferJSON,
+  proto,
   DisconnectReason,
   fetchLatestWaWebVersion,
   Browsers,
-  initAuthCreds,
-  BufferJSON,
-  proto
-} = require('@whiskeysockets/baileys');
+  generateWAMessageFromContent,
+  prepareWAMessageMedia,
+  jidNormalizedUser
+} = require('@rexxhayanasi/elaina-baileys');
 const pino = require('pino');
+const axios = require('axios');
+const sharp = require('sharp');
 
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -21,14 +26,14 @@ const SESSION_KEY = 'owner';
 let db;
 let sock;
 const awaitingLink = {};
+const processedIds = new Set();
 
-// Health check
 http.createServer((req, res) => {
   res.writeHead(200);
   res.end('OK');
-}).listen(PORT, () => console.log(`✅ Health on port ${PORT}`));
+}).listen(PORT, () => console.log(`✅ Health on ${PORT}`));
 
-// MongoDB auth state
+// ===== MongoDB auth state =====
 async function useMongoAuthState(key) {
   const coll = db.collection('sessions');
   const writeData = async (data, id) => {
@@ -42,7 +47,8 @@ async function useMongoAuthState(key) {
   const readData = async (id) => {
     const doc = await coll.findOne({ _id: `${key}-${id}` });
     if (!doc) return null;
-    try { return JSON.parse(doc.data, BufferJSON.reviver); } catch (e) { return null; }
+    try { return JSON.parse(doc.data, BufferJSON.reviver); }
+    catch (e) { return null; }
   };
   const removeData = async (id) => {
     await coll.deleteOne({ _id: `${key}-${id}` });
@@ -80,6 +86,133 @@ async function useMongoAuthState(key) {
   };
 }
 
+// ===== Fetch channel preview =====
+async function fetchPreview(url) {
+  try {
+    const res = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml'
+      },
+      timeout: 15000
+    });
+    const html = res.data;
+    const out = {};
+    let m = html.match(/<meta\s+property="og:title"\s+content="([^"]+)"/i);
+    if (m) out.title = m[1].replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+    m = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i);
+    if (m) out.description = m[1].replace(/&amp;/g, '&').replace(/&#039;/g, "'");
+    m = html.match(/<meta\s+property="og:image"\s+content="([^"]+)"/i);
+    if (m) out.image = m[1].replace(/&amp;/g, '&');
+
+    if (out.image) {
+      try {
+        const r = await axios.get(out.image, {
+          responseType: 'arraybuffer',
+          timeout: 10000,
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        const originalBuffer = Buffer.from(r.data);
+        // Convert to landscape (16:9) to satisfy status aspect ratio requirement
+        const metadata = await sharp(originalBuffer).metadata();
+        const targetWidth = 640;
+        const targetHeight = Math.round(targetWidth / 1.78); // 16:9 = 1.78 (well above 1.4 min)
+        const padded = await sharp(originalBuffer)
+          .resize({
+            width: Math.round(targetHeight * (metadata.width / metadata.height)),
+            height: targetHeight,
+            fit: 'contain',
+            background: { r: 0, g: 0, b: 0, alpha: 1 }
+          })
+          .extend({
+            top: 0, bottom: 0,
+            left: Math.max(0, Math.round((targetWidth - Math.round(targetHeight * (metadata.width / metadata.height))) / 2)),
+            right: Math.max(0, Math.round((targetWidth - Math.round(targetHeight * (metadata.width / metadata.height))) / 2)),
+            background: { r: 0, g: 0, b: 0, alpha: 1 }
+          })
+          .jpeg({ quality: 90 })
+          .toBuffer();
+        out.thumbBuffer = padded;
+        out.thumbWidth = targetWidth;
+        out.thumbHeight = targetHeight;
+        console.log(`[THUMB] resized to ${targetWidth}x${targetHeight} (ratio ${(targetWidth/targetHeight).toFixed(2)})`);
+      } catch (e) {
+        console.log('Thumb resize failed:', e.message);
+        out.thumbBuffer = null;
+      }
+    }
+    return out;
+  } catch (e) { console.log('Preview fetch failed:', e.message); return null; }
+}
+
+// ===== Send group status with preview card =====
+async function sendGroupStatusWithCard(groupJid, text, preview) {
+  const senderJid = jidNormalizedUser(sock.user?.id);
+
+  const contextInfo = {
+    forwardingScore: 0,
+    featureEligibilities: { canBeReshared: true, canReceiveMultiReact: true },
+    pairedMediaType: 0,
+    statusSourceType: 4,
+    isGroupStatus: true,
+    statusAttributions: [{ type: 6, groupStatus: { authorJid: senderJid } }],
+    statusAudienceMetadata: { audienceType: 1, listEmoji: '', listName: 'Channel Update' }
+  };
+
+  // Attach externalAdReply — the preview card
+  if (preview && preview.thumbBuffer) {
+    contextInfo.externalAdReply = {
+      title: preview.title || 'WhatsApp Channel',
+      body: preview.description || 'Tap to view channel',
+      mediaType: 1, // IMAGE — must be 1 for the card to render
+      thumbnail: preview.thumbBuffer,
+      thumbnailWidth: preview.thumbWidth,
+      thumbnailHeight: preview.thumbHeight,
+      sourceUrl: preview.channelUrl || 'https://whatsapp.com',
+      mediaUrl: preview.channelUrl || 'https://whatsapp.com',
+      renderLargerThumbnail: true,
+      showAdAttribution: false,
+      sourceApp: 'whatsapp'
+    };
+  }
+
+  const innerContent = {
+    extendedTextMessage: {
+      text: text,
+      font: 1,
+      backgroundArgb: 0xFF23313A,
+      contextInfo: contextInfo
+    }
+  };
+
+  const messageContent = { groupStatusMessageV2: { message: innerContent } };
+  const generated = generateWAMessageFromContent(groupJid, messageContent, { userJid: senderJid });
+  await sock.relayMessage(groupJid, generated.message, { messageId: generated.key.id });
+  return generated.key.id;
+}
+
+// ===== Send regular message with preview card =====
+async function sendMessageWithPreview(jid, text, preview) {
+  const opts = { text: text };
+  if (preview && preview.thumbBuffer) {
+    opts.contextInfo = {
+      externalAdReply: {
+        title: preview.title || 'WhatsApp Channel',
+        body: preview.description || 'Tap to view channel',
+        mediaType: 1,
+        thumbnail: preview.thumbBuffer,
+        thumbnailWidth: preview.thumbWidth,
+        thumbnailHeight: preview.thumbHeight,
+        sourceUrl: preview.channelUrl,
+        mediaUrl: preview.channelUrl,
+        renderLargerThumbnail: true,
+        showAdAttribution: false
+      }
+    };
+  }
+  await sock.sendMessage(jid, opts);
+}
+
 async function startBot() {
   const { state, saveCreds } = await useMongoAuthState(SESSION_KEY);
 
@@ -115,12 +248,9 @@ async function startBot() {
         console.log('========================================');
         console.log('🔑 PAIRING CODE: ' + code);
         console.log('========================================');
-        console.log('Open WhatsApp > Linked Devices > Link a Device > Link with phone number instead');
-        console.log('Enter code within 60 seconds.');
+        console.log('Enter in WhatsApp within 60 seconds.');
         console.log('');
-      } catch (e) {
-        console.log('Pair error:', e.message);
-      }
+      } catch (e) { console.log('Pair error:', e.message); }
     }, 3000);
   }
 
@@ -132,11 +262,7 @@ async function startBot() {
       const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
         ? lastDisconnect.error.output.statusCode : 0;
       console.log('Closed. Code:', code);
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(startBot, 5000);
-      } else {
-        console.log('⚠️ Logged out. Delete sessions from MongoDB and restart.');
-      }
+      if (code !== DisconnectReason.loggedOut) setTimeout(startBot, 5000);
     }
   });
 
@@ -150,49 +276,72 @@ async function startBot() {
           if (!msg || !msg.message) continue;
           const from = msg.key.remoteJid;
           if (!from) continue;
-          if (from.endsWith('@newsletter')) continue;
-          if (from.endsWith('@broadcast')) continue;
+          if (from.endsWith('@newsletter') || from.endsWith('@broadcast')) continue;
           if (!from.endsWith('@g.us')) continue;
           if (!msg.key.fromMe) continue;
 
+          const msgAge = Date.now() / 1000 - (msg.messageTimestamp || 0);
+          if (msgAge > 30) continue;
+          if (processedIds.has(msg.key.id)) continue;
+          processedIds.add(msg.key.id);
+          if (processedIds.size > 500) {
+            const arr = Array.from(processedIds);
+            processedIds.clear();
+            arr.slice(-250).forEach(id => processedIds.add(id));
+          }
+
           const text = msg.message.conversation ||
-            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) ||
-            (msg.message.imageMessage && msg.message.imageMessage.caption) || '';
+            (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '';
           const t = text.trim().toLowerCase();
 
-          console.log(`[MSG] ${from} "${text.substring(0, 60)}"`);
+          console.log(`[MSG] ${from} "${text.substring(0, 50)}"`);
 
           if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
             awaitingLink[from] = t.replace('.', '');
             const hint = t.includes('status') ? 'status' : 'message';
             const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
-            console.log(`  → ${t} triggered`);
-            await sock.sendMessage(from, {
-              text: `Send your message with the channel link to post as ${hint} to ${scope}.`
-            }, { quoted: msg });
+            await sock.sendMessage(from, { text: `Send your message with the channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
             continue;
           }
 
           if (awaitingLink[from]) {
+            const hasLink = /(https?:\/\/[^\s]+)/i.test(text);
+            if (!hasLink) continue;
+
             const mode = awaitingLink[from];
             delete awaitingLink[from];
             const isStatus = mode.includes('status');
             const toAll = mode.includes('all');
+            const channelLink = text.match(/(https?:\/\/[^\s]+)/)[0];
+
+            console.log(`[POST] ${mode} — fetching preview for ${channelLink}`);
+            const preview = await fetchPreview(channelLink);
+            if (preview) preview.channelUrl = channelLink;
+
+            if (preview && preview.title) {
+              console.log(`[PREVIEW] "${preview.title}" thumb=${preview.thumbBuffer ? preview.thumbBuffer.length + 'B' : 'none'}`);
+            } else {
+              console.log('[PREVIEW] failed');
+            }
 
             const post = async (jid) => {
-              const opts = { text: text };
-              if (isStatus) opts.groupStatus = true;
-              await sock.sendMessage(jid, opts);
+              if (isStatus) {
+                await sendGroupStatusWithCard(jid, text, preview);
+                console.log(`  ✓ status posted to ${jid}`);
+              } else {
+                await sendMessageWithPreview(jid, text, preview);
+                console.log(`  ✓ message posted to ${jid}`);
+              }
             };
 
             if (toAll) {
               const groups = await sock.groupFetchAllParticipating();
               const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
-              await sock.sendMessage(from, { text: `📤 Posting to ${ids.length} groups...` });
+              await sock.sendMessage(from, { text: `📤 Posting ${mode} to ${ids.length} groups...` });
               let s = 0, f = 0;
               for (const g of ids) {
-                try { await post(g); s++; console.log(`  ✓ ${g}`); }
-                catch (e) { f++; console.log(`  ✗ ${g}`); }
+                try { await post(g); s++; }
+                catch (e) { f++; console.log(`  ✗ ${g}: ${e.message}`); }
                 await new Promise(r => setTimeout(r, 5000));
               }
               await sock.sendMessage(from, { text: `✅ Done. Success: ${s}, Failed: ${f}` });
@@ -201,17 +350,14 @@ async function startBot() {
                 await post(from);
                 await sock.sendMessage(from, { text: '✅ Posted!' });
               } catch (e) {
+                console.log(`[POST ERR] ${e.message}`);
                 await sock.sendMessage(from, { text: '❌ Failed: ' + e.message });
               }
             }
           }
-        } catch (e) {
-          console.log('[MSG ERR]', e.message);
-        }
+        } catch (e) { console.log('[MSG ERR]', e.message); }
       }
-    } catch (e) {
-      console.log('[UPSERT ERR]', e.message);
-    }
+    } catch (e) { console.log('[UPSERT ERR]', e.message); }
   });
 }
 
