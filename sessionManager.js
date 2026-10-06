@@ -48,19 +48,18 @@ async function isOwnerAdmin(sock, telegramId, groupJid, ownerNumber) {
 async function createSession(telegramId, phoneNumber, skipWipe = false) {
   if (!skipWipe) {
     await removeSession(telegramId);
-                             }
+  }
 
   const { state, saveCreds } = await useMongoAuthState(telegramId);
 
-  // FIX 1: Use fetchLatestWaWebVersion (fetchLatestBaileysVersion returns a stale version)
   let version;
   try {
     const r = await fetchLatestWaWebVersion();
     version = r.version;
     console.log(`Using WA Web version: ${version.join('.')}`);
   } catch (e) {
-    console.log('fetchLatestWaWebVersion failed, using fallback');
     version = [2, 3000, 1035194821];
+    console.log('Using fallback version');
   }
 
   const sock = makeWASocket({
@@ -68,7 +67,6 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
-    // FIX 2: Use canonical macOS Chrome (Ubuntu is rejected for phone pairing)
     browser: Browsers.macOS('Chrome'),
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true
@@ -86,14 +84,14 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
     phone: phoneNumber,
     groups: 0,
     protectionEnabled,
-    hasSentConnectMsg: false
+    hasSentConnectMsg: false,
+    ownerNumber: String(phoneNumber).replace(/\D/g, '')
   };
   activeSessions.set(telegramId, session);
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Request code ONLY ONCE per /pair
     if (qr && !sock.authState.creds.registered && !pairingCodeSent.get(telegramId)) {
       pairingCodeSent.set(telegramId, true);
       try {
@@ -116,22 +114,15 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
     if (connection === 'connecting') session.status = 'connecting';
 
     if (connection === 'open') {
-      // Reject fake connections
       if (!sock.user || !sock.user.id) {
-        console.log(`⚠️ Fake connect for ${telegramId} — no user. Closing.`);
+        console.log(`⚠️ Fake connect for ${telegramId}`);
         try { sock.end(undefined); } catch (e) {}
-        try {
-          const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
-          for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
-        } catch (e) {}
-        setTimeout(() => createSession(telegramId, phoneNumber), 3000);
         return;
       }
 
       if (session.hasSentConnectMsg) return;
       session.hasSentConnectMsg = true;
       session.status = 'connected';
-      session.ownerNumber = String(phoneNumber).replace(/\D/g, '');
       console.log(`✅ Real connect: ${telegramId} (${session.ownerNumber})`);
 
       try {
@@ -153,7 +144,6 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
         { upsert: true }
       );
 
-      // Send commands to user's WhatsApp self-chat
       try {
         const selfJid = session.ownerNumber + '@s.whatsapp.net';
         await sock.sendMessage(selfJid, {
@@ -175,8 +165,7 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
         `✅ *WhatsApp connected!*\n\n` +
         `📱 Phone: ${phoneNumber}\n` +
         `👥 Groups: ${session.groups}\n` +
-        `🛡️ Protection: ${session.protectionEnabled ? 'ON' : 'OFF'}\n\n` +
-        `📩 Commands sent to your WhatsApp (Message Yourself).`,
+        `🛡️ Protection: ${session.protectionEnabled ? 'ON' : 'OFF'}`,
         { parse_mode: 'Markdown' }
       );
     }
@@ -194,20 +183,12 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
         );
         await notifyUser(telegramId, '⚠️ WhatsApp disconnected. Use /pair to link again.');
       } else if (code === 401) {
-        console.log(`401 auth failed for ${telegramId}. Wiping session.`);
+        console.log(`401 for ${telegramId}. Wiping.`);
         session.status = 'logged_out';
         activeSessions.delete(telegramId);
-        try {
-          const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
-          for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
-        } catch (e) {}
-        await db.collection('users').updateOne(
-          { telegram_id: telegramId }, { $set: { status: 'logged_out' } }
-        );
-        await notifyUser(telegramId, '❌ Pairing failed (code 401). Send /pair again to retry.');
       } else {
         session.status = 'reconnecting';
-        setTimeout(() => createSession(telegramId, phoneNumber), 8000);
+        setTimeout(() => createSession(telegramId, phoneNumber, true), 8000);
       }
     }
   });
@@ -216,103 +197,131 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
   const warnings = new Map();
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    const firstMsg = messages[0];
-    const isOwnMessage = firstMsg && firstMsg.key && firstMsg.key.fromMe;
-    if (type !== 'notify' && !(type === 'append' && isOwnMessage)) return;
-    const msg = messages[0];
-    if (!msg.message) return;
+    try {
+      // DEBUG LOG
+      console.log(`\n[UPSERT] type=${type} count=${messages.length}`);
+      if (!messages || messages.length === 0) return;
+      if (type !== 'notify' && type !== 'append') return;
 
-    const from = msg.key.remoteJid;
-    if (!from) return;
-    if (from.endsWith('@newsletter')) return;
-    if (from.endsWith('@broadcast')) return;
-    if (!from.endsWith('@g.us')) return;
+      for (const msg of messages) {
+        try {
+          if (!msg || !msg.message) continue;
+          const from = msg.key.remoteJid;
+          if (!from) continue;
 
-    const text = getText(msg);
-    const t = text.trim().toLowerCase();
-    const senderJid = msg.key.participant || msg.key.remoteJid;
-    const senderNum = senderJid.split('@')[0].split(':')[0];
+          const textPreview = getText(msg).substring(0, 60);
+          console.log(`[MSG] from=${from} fromMe=${msg.key.fromMe} text="${textPreview}" type=${type}`);
 
-    if (msg.key.fromMe) {
-      if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
-        const mode = t.replace('.', '');
-        awaitingLink[from] = mode;
-        const hint = t.includes('status') ? 'status' : 'message';
-        const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
-        await sock.sendMessage(from, { text: `Send your channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
-        return;
-      }
-      if (awaitingLink[from]) {
-        const mode = awaitingLink[from];
-        delete awaitingLink[from];
-        const linkMatch = text.match(/(https?:\/\/[^\s]+)/);
-        if (!linkMatch) return;
-        const channelLink = linkMatch[0];
-        const extraText = text.replace(channelLink, '').trim();
-        const finalText = extraText ? extraText + '\n' + channelLink : channelLink;
-        const isStatus = mode.includes('status');
-        const toAll = mode.includes('all');
+          if (from.endsWith('@newsletter')) continue;
+          if (from.endsWith('@broadcast')) continue;
+          if (!from.endsWith('@g.us')) continue;
 
-        async function post(jid) {
-          const opts = { text: finalText };
-          if (isStatus) opts.groupStatus = true;
-          await sock.sendMessage(jid, opts);
-        }
+          const text = getText(msg);
+          const t = text.trim().toLowerCase();
+          const senderJid = msg.key.participant || msg.key.remoteJid;
+          const senderNum = senderJid.split('@')[0].split(':')[0];
 
-        if (toAll) {
-          const groups = await sock.groupFetchAllParticipating();
-          const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
-          await sock.sendMessage(from, { text: `📤 Posting to ${ids.length} groups...` });
-          let s = 0, f = 0;
-          for (const g of ids) {
-            try { await post(g); s++; } catch (e) { f++; }
-            await new Promise(r => setTimeout(r, 8000));
+          // ---- Owner commands ----
+          if (msg.key.fromMe) {
+            if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
+              const mode = t.replace('.', '');
+              awaitingLink[from] = mode;
+              const hint = t.includes('status') ? 'status' : 'message';
+              const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
+              console.log(`[CMD] ${mode} triggered in ${from}`);
+              try {
+                await sock.sendMessage(from, { text: `Send your channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
+                console.log(`[CMD] Reply sent`);
+              } catch (e) {
+                console.log(`[CMD] Reply failed: ${e.message}`);
+              }
+              continue;
+            }
+
+            if (awaitingLink[from]) {
+              const mode = awaitingLink[from];
+              delete awaitingLink[from];
+              const linkMatch = text.match(/(https?:\/\/[^\s]+)/);
+              if (!linkMatch) {
+                console.log(`[LINK] No link found in message`);
+                continue;
+              }
+              const channelLink = linkMatch[0];
+              const extraText = text.replace(channelLink, '').trim();
+              const finalText = extraText ? extraText + '\n' + channelLink : channelLink;
+              const isStatus = mode.includes('status');
+              const toAll = mode.includes('all');
+
+              async function post(jid) {
+                const opts = { text: finalText };
+                if (isStatus) opts.groupStatus = true;
+                await sock.sendMessage(jid, opts);
+              }
+
+              if (toAll) {
+                const groups = await sock.groupFetchAllParticipating();
+                const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
+                await sock.sendMessage(from, { text: `📤 Posting to ${ids.length} groups...` });
+                let s = 0, f = 0;
+                for (const g of ids) {
+                  try { await post(g); s++; } catch (e) { f++; }
+                  await new Promise(r => setTimeout(r, 8000));
+                }
+                await sock.sendMessage(from, { text: `✅ Done. Success: ${s}, Failed: ${f}` });
+              } else {
+                try { await post(from); await sock.sendMessage(from, { text: '✅ Posted!' }); }
+                catch (e) { await sock.sendMessage(from, { text: '❌ Failed: ' + e.message }); }
+              }
+              continue;
+            }
+            continue;
           }
-          await sock.sendMessage(from, { text: `✅ Done. Success: ${s}, Failed: ${f}` });
-        } else {
-          try { await post(from); await sock.sendMessage(from, { text: '✅ Posted!' }); }
-          catch (e) { await sock.sendMessage(from, { text: '❌ Failed: ' + e.message }); }
+
+          // ---- Non-owner: admin commands ----
+          if (isAdminCommand(t)) {
+            const isAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
+            if (!isAdmin) {
+              await sock.sendMessage(from, { text: '❌ This command is for the admin.' }, { quoted: msg });
+            }
+            continue;
+          }
+
+          // ---- Group description question ----
+          if (asksAboutGroup(text)) {
+            await sock.sendMessage(from, { text: '📖 Please read the group description.' }, { quoted: msg });
+            continue;
+          }
+
+          // ---- Protection ----
+          if (session.protectionEnabled && session.ownerNumber) {
+            const ownerAdmin = await isOwnerAdmin(sock, telegramId, from, session.ownerNumber);
+            if (!ownerAdmin) continue;
+            const senderAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
+            if (senderAdmin) continue;
+
+            const violations = detectViolations(msg);
+            if (violations.length > 0) {
+              try { await sock.sendMessage(from, { delete: msg.key }); } catch (e) {}
+              const wkey = `${from}-${senderJid}`;
+              const count = (warnings.get(wkey) || 0) + 1;
+              warnings.set(wkey, count);
+              if (count >= 3) {
+                try {
+                  await sock.groupParticipantsUpdate(from, [senderJid], 'remove');
+                  await sock.sendMessage(from, { text: `🚫 @${senderNum} removed after 3 warnings.`, mentions: [senderJid] });
+                  warnings.delete(wkey);
+                } catch (e) {}
+              } else {
+                await sock.sendMessage(from, { text: `⚠️ @${senderNum} Warning ${count}/3 — ${violations.join(', ')}.`, mentions: [senderJid] }, { quoted: msg });
+              }
+            }
+          }
+        } catch (e) {
+          console.log(`[MSG ERROR] ${e.message}`);
         }
-        return;
       }
-      return;
-    }
-
-    if (isAdminCommand(t)) {
-      const isAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
-      if (!isAdmin) {
-        await sock.sendMessage(from, { text: '❌ This command is for the admin.' }, { quoted: msg });
-      }
-      return;
-    }
-
-    if (asksAboutGroup(text)) {
-      await sock.sendMessage(from, { text: '📖 Please read the group description.' }, { quoted: msg });
-      return;
-    }
-
-    if (session.protectionEnabled && session.ownerNumber) {
-      const ownerAdmin = await isOwnerAdmin(sock, telegramId, from, session.ownerNumber);
-      if (!ownerAdmin) return;
-      const senderAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
-      if (senderAdmin) return;
-
-      const violations = detectViolations(msg);
-      if (violations.length > 0) {
-        try { await sock.sendMessage(from, { delete: msg.key }); } catch (e) {}
-        const wkey = `${from}-${senderJid}`;
-        const count = (warnings.get(wkey) || 0) + 1;
-        warnings.set(wkey, count);
-        if (count >= 3) {
-          try {
-            await sock.groupParticipantsUpdate(from, [senderJid], 'remove');
-            await sock.sendMessage(from, { text: `🚫 @${senderNum} removed after 3 warnings.`, mentions: [senderJid] });
-            warnings.delete(wkey);
-          } catch (e) {}
-        } else {
-          await sock.sendMessage(from, { text: `⚠️ @${senderNum} Warning ${count}/3 — ${violations.join(', ')}.`, mentions: [senderJid] }, { quoted: msg });
-        }
-      }
+    } catch (e) {
+      console.log(`[UPSERT ERROR] ${e.message}`);
     }
   });
 
@@ -341,7 +350,6 @@ function setProtection(telegramId, enabled) {
 
 function resetPairingCode(telegramId) {
   pairingCodeSent.delete(telegramId);
-  console.log(`Pairing code reset for ${telegramId}`);
 }
 
 async function restoreAllSessions() {
