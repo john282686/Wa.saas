@@ -216,7 +216,9 @@ async function createSession(telegramId, phoneNumber, skipWipe = false) {
   const warnings = new Map();
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    const firstMsg = messages[0];
+    const isOwnMessage = firstMsg && firstMsg.key && firstMsg.key.fromMe;
+    if (type !== 'notify' && !(type === 'append' && isOwnMessage)) return;
     const msg = messages[0];
     if (!msg.message) return;
 
