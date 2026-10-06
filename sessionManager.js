@@ -362,11 +362,13 @@ function setProtection(telegramId, enabled) {
   if (s) s.protectionEnabled = !!enabled;
 }
 
-async function restoreAllSessions() {
+
+    console.log(`Restoriasync function restoreAllSessions() {
   try {
     const users = await getDB().collection('users')
-      .find({ status: { $in: ['connected', 'reconnecting'] } }).toArray();
-    console.log(`Restoring ${users.length} session(s)...`);
+      .find({ status: { $in: ['connected', 'reconnecting'] } })
+      .limit(1)
+      .toArray();ng ${users.length} session(s)...`);
     for (const user of users) {
       try {
         await createSession(user.telegram_id, user.phone_number);
