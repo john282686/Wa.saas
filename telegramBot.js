@@ -1,351 +1,186 @@
-// sessionManager.js
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
-const pino = require('pino');
+// telegramBot.js
+const { Telegraf, Markup } = require('telegraf');
+const { createSession, removeSession, getSession, setNotifier, setProtection } = require('./sessionManager');
 const { getDB } = require('./db');
-const { useMongoAuthState } = require('./authState');
-const { getText, detectViolations, isAdminCommand, asksAboutGroup } = require('./groupProtection');
 
-const activeSessions = new Map();
-const adminCache = new Map();
-let notifyUserFn = null;
+const userState = new Map();
 
-function setNotifier(fn) { notifyUserFn = fn; }
+function startTelegramBot() {
+  const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-async function notifyUser(telegramId, message, extra = {}) {
-  if (notifyUserFn) {
-    try { await notifyUserFn(telegramId, message, extra); }
-    catch (e) { console.log('Notify err:', e.message); }
-  }
-}
-
-async function getGroupAdmins(sock, telegramId, groupJid) {
-  const key = `${telegramId}-${groupJid}`;
-  const cached = adminCache.get(key);
-  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.admins;
-  try {
-    const meta = await sock.groupMetadata(groupJid);
-    const admins = meta.participants
-      .filter(p => p.admin === 'admin' || p.admin === 'superadmin')
-      .map(p => p.id.split('@')[0].split(':')[0]);
-    adminCache.set(key, { admins, ts: Date.now() });
-    return admins;
-  } catch (e) { return []; }
-}
-
-async function isParticipantAdmin(sock, telegramId, groupJid, participantJid) {
-  if (!participantJid) return false;
-  const num = participantJid.split('@')[0].split(':')[0];
-  const admins = await getGroupAdmins(sock, telegramId, groupJid);
-  return admins.includes(num);
-}
-
-async function isOwnerAdmin(sock, telegramId, groupJid, ownerNumber) {
-  const admins = await getGroupAdmins(sock, telegramId, groupJid);
-  return admins.includes(String(ownerNumber).replace(/\D/g, ''));
-}
-
-async function createSession(telegramId, phoneNumber) {
-  await removeSession(telegramId);
-
-  const { state, saveCreds } = await useMongoAuthState(telegramId);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-    auth: state,
-    browser: Browsers.ubuntu('Chrome'),
-    markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: true
+  setNotifier(async (telegramId, message, extra = {}) => {
+    try { await bot.telegram.sendMessage(telegramId, message, extra); }
+    catch (e) { console.log(`Notify ${telegramId} fail: ${e.message}`); }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  const MAIN_MENU = Markup.keyboard([
+    ['🔗 Link WhatsApp', '📊 Dashboard'],
+    ['🛡️ Protect ON', '🛑 Protect OFF'],
+    ['📋 Commands', '❓ Help']
+  ]).resize();
 
-  const db = getDB();
-  const user = await db.collection('users').findOne({ telegram_id: telegramId });
-  const protectionEnabled = user ? !!user.protection_enabled : false;
+  bot.start((ctx) => {
+    ctx.reply(
+      '🤖 *Welcome to WhatsApp Guardian Bot*\n\n' +
+      'I protect your WhatsApp groups from:\n' +
+      '• Links & spam\n' +
+      '• Forwards & contact cards\n' +
+      '• Phone numbers & group invites\n\n' +
+      'I can also post messages & statuses to all your groups.\n\n' +
+      'Choose an option below to begin 👇',
+      { parse_mode: 'Markdown', ...MAIN_MENU }
+    );
+  });
 
-  const session = {
-    sock,
-    status: 'pending',
-    phone: phoneNumber,
-    groups: 0,
-    protectionEnabled,
-    hasSentConnectMsg: false,
-    phoneForReconnect: phoneNumber
-  };
-  activeSessions.set(telegramId, session);
-
-  let codeRequested = false;
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // ---- Only request code when QR fires AND not registered ----
-    if (qr && !sock.authState.creds.registered && !codeRequested) {
-      codeRequested = true;
-      try {
-        const code = await sock.requestPairingCode(phoneNumber);
-        console.log(`🔑 Pair code for ${telegramId}: ${code}`);
-        await notifyUser(telegramId,
-          `🔑 *Your Pairing Code:* \`${code}\`\n\n` +
-          `1. Open WhatsApp\n` +
-          `2. Settings → Linked Devices\n` +
-          `3. Link a Device → Link with phone number instead\n` +
-          `4. Enter this code (valid 60 seconds only)`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (e) {
-        console.log(`Pair err ${telegramId}: ${e.message}`);
-        await notifyUser(telegramId, `❌ Pairing failed: ${e.message}`);
-      }
+  bot.hears('🔗 Link WhatsApp', (ctx) => {
+    const telegramId = ctx.from.id;
+    const existing = getSession(telegramId);
+    if (existing && existing.status === 'connected') {
+      return ctx.reply('⚠️ WhatsApp already linked. Send /unpair first to link a different number.');
     }
+    userState.set(telegramId, { action: 'awaiting_number' });
+    ctx.reply('📱 Send your WhatsApp number with country code (digits only).\n\nExample: `233XXXXXXXXX`', { parse_mode: 'Markdown' });
+  });
 
-    if (connection === 'connecting') session.status = 'connecting';
+  bot.hears('📊 Dashboard', async (ctx) => {
+    const telegramId = ctx.from.id;
+    const session = getSession(telegramId);
+    if (!session || session.status !== 'connected') {
+      return ctx.reply('❌ No WhatsApp linked yet.\n\nTap "🔗 Link WhatsApp" to begin.');
+    }
+    let groups = 0;
+    try {
+      const g = await session.sock.groupFetchAllParticipating();
+      groups = Object.keys(g).filter(k => !k.endsWith('@newsletter')).length;
+    } catch (e) {}
+    const user = await getDB().collection('users').findOne({ telegram_id: telegramId });
+    ctx.reply(
+      `📊 *Your Dashboard*\n\n` +
+      `Status: 🟢 Live\n` +
+      `Phone: \`${session.phone}\`\n` +
+      `Groups: ${groups}\n` +
+      `Protection: ${session.protectionEnabled ? '🛡️ ON' : '🛑 OFF'}\n` +
+      `Broadcasts sent: ${user?.broadcasts_count || 0}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
 
-    if (connection === 'open') {
-      // ---- Reject FAKE connections ----
-      if (!sock.user || !sock.user.id) {
-        console.log(`⚠️ Fake connect for ${telegramId} — no user. Closing.`);
-        try { sock.end(undefined); } catch (e) {}
-        // Wipe stale session from DB
-        try {
-          const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
-          for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
-        } catch (e) {}
-        setTimeout(() => createSession(telegramId, phoneNumber), 3000);
-        return;
-      }
+  bot.hears('🛡️ Protect ON', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session || session.status !== 'connected') return ctx.reply('❌ Link WhatsApp first.');
+    setProtection(ctx.from.id, true);
+    await getDB().collection('users').updateOne(
+      { telegram_id: ctx.from.id }, { $set: { protection_enabled: true } }
+    );
+    ctx.reply('🛡️ Protection *ON*.\n\nYour groups will now be guarded where you are admin.', { parse_mode: 'Markdown' });
+  });
 
-      if (session.hasSentConnectMsg) return;
-      session.hasSentConnectMsg = true;
-      session.status = 'connected';
-      session.ownerNumber = String(phoneNumber).replace(/\D/g, '');
-      console.log(`✅ Real connect: ${telegramId} (${session.ownerNumber})`);
+  bot.hears('🛑 Protect OFF', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session || session.status !== 'connected') return ctx.reply('❌ Link WhatsApp first.');
+    setProtection(ctx.from.id, false);
+    await getDB().collection('users').updateOne(
+      { telegram_id: ctx.from.id }, { $set: { protection_enabled: false } }
+    );
+    ctx.reply('🛑 Protection *OFF*.', { parse_mode: 'Markdown' });
+  });
 
-      try {
-        const groups = await sock.groupFetchAllParticipating();
-        session.groups = Object.keys(groups).filter(k => !k.endsWith('@newsletter')).length;
-      } catch (e) {}
+  bot.hears('📋 Commands', (ctx) => {
+    ctx.reply(
+      '📋 *WhatsApp Commands*\n\n' +
+      '*Owner (send in a group you admin):*\n' +
+      '`.send` — Post to this group\n' +
+      '`.sendall` — Post to all your groups\n' +
+      '`.status` — Status in this group\n' +
+      '`.statusall` — Status in all groups\n\n' +
+      '*Auto protection (when ON):*\n' +
+      '🚫 Links, phone numbers, invites, forwards, contacts\n' +
+      '⚠️ 3 warnings → removal\n' +
+      '✅ Admins exempt',
+      { parse_mode: 'Markdown' }
+    );
+  });
 
-      await db.collection('users').updateOne(
-        { telegram_id: telegramId },
-        {
-          $set: {
-            telegram_id: telegramId,
-            phone_number: phoneNumber,
-            status: 'connected',
-            last_active: new Date(),
-            groups_count: session.groups
-          }
-        },
-        { upsert: true }
+  bot.hears('❓ Help', (ctx) => {
+    ctx.reply(
+      '📖 *How to use*\n\n' +
+      '1. Tap "🔗 Link WhatsApp"\n' +
+      '2. Send your number\n' +
+      '3. Enter the pairing code in WhatsApp\n' +
+      '4. Bot sends commands to your WhatsApp\n' +
+      '5. Tap "🛡️ Protect ON" to guard your groups',
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // Old command-style inputs (still work)
+  bot.command('pair', (ctx) => {
+    userState.set(ctx.from.id, { action: 'awaiting_number' });
+    ctx.reply('📱 Send your WhatsApp number with country code (digits only).\n\nExample: `233XXXXXXXXX`', { parse_mode: 'Markdown' });
+  });
+
+  bot.command('unpair', async (ctx) => {
+    await removeSession(ctx.from.id);
+    await getDB().collection('users').updateOne(
+      { telegram_id: ctx.from.id }, { $set: { status: 'logged_out' } }
+    );
+    ctx.reply('✅ WhatsApp unlinked.');
+  });
+
+  bot.command('commands', (ctx) => {
+    ctx.reply(
+      '📋 *WhatsApp Commands*\n\n' +
+      '`.send` / `.sendall` / `.status` / `.statusall`\n\n' +
+      'Use "🛡️ Protect ON" to enable group protection.',
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.command('protect', async (ctx) => {
+    const arg = (ctx.message.text.split(' ')[1] || '').toLowerCase();
+    const session = getSession(ctx.from.id);
+    if (!session || session.status !== 'connected') return ctx.reply('❌ Link WhatsApp first.');
+    if (arg === 'on') {
+      setProtection(ctx.from.id, true);
+      await getDB().collection('users').updateOne(
+        { telegram_id: ctx.from.id }, { $set: { protection_enabled: true } }
       );
-
-      // Send commands to WhatsApp self-chat
-      try {
-        const selfJid = session.ownerNumber + '@s.whatsapp.net';
-        await sock.sendMessage(selfJid, {
-          text:
-            `🤖 *WhatsApp Guardian Bot — Commands*\n\n` +
-            `*Owner commands (in any group you admin):*\n` +
-            `.send — Post to this group\n` +
-            `.sendall — Post to ALL your groups\n` +
-            `.status — Status in this group\n` +
-            `.statusall — Status in ALL groups\n\n` +
-            `*Auto protection (turn on in Telegram):*\n` +
-            `🚫 Links, phone numbers, invites, forwards, contacts\n` +
-            `⚠️ 3 warnings → removal\n` +
-            `✅ Admins exempt`
-        });
-      } catch (e) { console.log('Self-chat send failed:', e.message); }
-
-      await notifyUser(telegramId,
-        `✅ *WhatsApp connected!*\n\n` +
-        `📱 Phone: ${phoneNumber}\n` +
-        `👥 Groups: ${session.groups}\n` +
-        `🛡️ Protection: ${session.protectionEnabled ? 'ON' : 'OFF'}\n\n` +
-        `📩 Commands sent to your WhatsApp (Message Yourself).`,
-        { parse_mode: 'Markdown' }
+      ctx.reply('🛡️ Protection ON.');
+    } else if (arg === 'off') {
+      setProtection(ctx.from.id, false);
+      await getDB().collection('users').updateOne(
+        { telegram_id: ctx.from.id }, { $set: { protection_enabled: false } }
       );
-    }
-
-    if (connection === 'close') {
-      const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output
-        ? lastDisconnect.error.output.statusCode : 0;
-      console.log(`Close ${telegramId}. Code: ${code}`);
-
-      if (code === DisconnectReason.loggedOut) {
-        session.status = 'logged_out';
-        activeSessions.delete(telegramId);
-        await db.collection('users').updateOne(
-          { telegram_id: telegramId }, { $set: { status: 'logged_out' } }
-        );
-        await notifyUser(telegramId, '⚠️ WhatsApp disconnected. Use /pair to link again.');
-      } else if (code === 401) {
-        // Auth failed — wipe and stop looping
-        console.log(`401 auth failed for ${telegramId}. Wiping session.`);
-        session.status = 'logged_out';
-        activeSessions.delete(telegramId);
-        try {
-          const docs = await db.collection('sessions').find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
-          for (const d of docs) await db.collection('sessions').deleteOne({ _id: d._id });
-        } catch (e) {}
-        await db.collection('users').updateOne(
-          { telegram_id: telegramId }, { $set: { status: 'logged_out' } }
-        );
-        await notifyUser(telegramId, '❌ Pairing failed (code 401). Send /pair again to retry.');
-      } else {
-        session.status = 'reconnecting';
-        setTimeout(() => createSession(telegramId, phoneNumber), 8000);
-      }
+      ctx.reply('🛑 Protection OFF.');
+    } else {
+      ctx.reply('Usage: `/protect on` or `/protect off`', { parse_mode: 'Markdown' });
     }
   });
 
-  const awaitingLink = {};
-  const warnings = new Map();
+  bot.command('dashboard', async (ctx) => {
+    const session = getSession(ctx.from.id);
+    if (!session || session.status !== 'connected') return ctx.reply('❌ No WhatsApp linked.');
+    ctx.reply(`📊 Status: 🟢 Live\nPhone: ${session.phone}\nProtection: ${session.protectionEnabled ? 'ON' : 'OFF'}`);
+  });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
-    if (!msg.message) return;
+  bot.on('text', async (ctx) => {
+    const telegramId = ctx.from.id;
+    const text = ctx.message.text.trim();
+    const state = userState.get(telegramId);
+    if (!state) return;
 
-    const from = msg.key.remoteJid;
-    if (!from) return;
-    if (from.endsWith('@newsletter')) return;
-    if (from.endsWith('@broadcast')) return;
-    if (!from.endsWith('@g.us')) return;
-
-    const text = getText(msg);
-    const t = text.trim().toLowerCase();
-    const senderJid = msg.key.participant || msg.key.remoteJid;
-    const senderNum = senderJid.split('@')[0].split(':')[0];
-
-    // Owner commands
-    if (msg.key.fromMe) {
-      if (t === '.send' || t === '.sendall' || t === '.status' || t === '.statusall') {
-        const mode = t.replace('.', '');
-        awaitingLink[from] = mode;
-        const hint = t.includes('status') ? 'status' : 'message';
-        const scope = t.includes('all') ? 'ALL groups' : 'THIS group';
-        await sock.sendMessage(from, { text: `Send your channel link to post as ${hint} to ${scope}.` }, { quoted: msg });
-        return;
-      }
-      // Handle link reply
-      if (awaitingLink[from]) {
-        const mode = awaitingLink[from];
-        delete awaitingLink[from];
-        const linkMatch = text.match(/(https?:\/\/[^\s]+)/);
-        if (!linkMatch) return;
-        const channelLink = linkMatch[0];
-        const extraText = text.replace(channelLink, '').trim();
-        const finalText = extraText ? extraText + '\n' + channelLink : channelLink;
-        const isStatus = mode.includes('status');
-        const toAll = mode.includes('all');
-
-        async function post(jid) {
-          const opts = { text: finalText };
-          if (isStatus) opts.groupStatus = true;
-          await sock.sendMessage(jid, opts);
-        }
-
-        if (toAll) {
-          const groups = await sock.groupFetchAllParticipating();
-          const ids = Object.keys(groups).filter(g => !g.endsWith('@newsletter'));
-          await sock.sendMessage(from, { text: `📤 Posting to ${ids.length} groups...` });
-          let s = 0, f = 0;
-          for (const g of ids) {
-            try { await post(g); s++; } catch (e) { f++; }
-            await new Promise(r => setTimeout(r, 8000));
-          }
-          await sock.sendMessage(from, { text: `✅ Done. Success: ${s}, Failed: ${f}` });
-        } else {
-          try { await post(from); await sock.sendMessage(from, { text: '✅ Posted!' }); }
-          catch (e) { await sock.sendMessage(from, { text: '❌ Failed: ' + e.message }); }
-        }
-        return;
-      }
+    if (state.action === 'awaiting_number') {
+      if (!/^\d{8,15}$/.test(text)) return ctx.reply('❌ Invalid. Send digits only (e.g. 233XXXXXXXXX).');
+      userState.delete(telegramId);
+      await ctx.reply('⏳ Creating session...');
+      try { await createSession(telegramId, text); }
+      catch (e) { ctx.reply(`❌ Error: ${e.message}`); }
       return;
-    }
-
-    // Non-owner checks
-    if (isAdminCommand(t)) {
-      const isAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
-      if (!isAdmin) {
-        await sock.sendMessage(from, { text: '❌ This command is for the admin.' }, { quoted: msg });
-      }
-      return;
-    }
-
-    if (asksAboutGroup(text)) {
-      await sock.sendMessage(from, { text: '📖 Please read the group description.' }, { quoted: msg });
-      return;
-    }
-
-    if (session.protectionEnabled && session.ownerNumber) {
-      const ownerAdmin = await isOwnerAdmin(sock, telegramId, from, session.ownerNumber);
-      if (!ownerAdmin) return;
-      const senderAdmin = await isParticipantAdmin(sock, telegramId, from, senderJid);
-      if (senderAdmin) return;
-
-      const violations = detectViolations(msg);
-      if (violations.length > 0) {
-        try { await sock.sendMessage(from, { delete: msg.key }); } catch (e) {}
-        const wkey = `${from}-${senderJid}`;
-        const count = (warnings.get(wkey) || 0) + 1;
-        warnings.set(wkey, count);
-        if (count >= 3) {
-          try {
-            await sock.groupParticipantsUpdate(from, [senderJid], 'remove');
-            await sock.sendMessage(from, { text: `🚫 @${senderNum} removed after 3 warnings.`, mentions: [senderJid] });
-            warnings.delete(wkey);
-          } catch (e) {}
-        } else {
-          await sock.sendMessage(from, { text: `⚠️ @${senderNum} Warning ${count}/3 — ${violations.join(', ')}.`, mentions: [senderJid] }, { quoted: msg });
-        }
-      }
     }
   });
 
-  return sock;
+  bot.launch();
+  console.log('✅ Telegram bot launched');
 }
 
-async function removeSession(telegramId) {
-  const existing = activeSessions.get(telegramId);
-  if (existing && existing.sock) {
-    try { existing.sock.end(undefined); } catch (e) {}
-  }
-  activeSessions.delete(telegramId);
-  try {
-    const coll = getDB().collection('sessions');
-    const docs = await coll.find({ _id: { $regex: `^user_${telegramId}-` } }).toArray();
-    for (const d of docs) await coll.deleteOne({ _id: d._id });
-  } catch (e) {}
-}
-
-function getSession(telegramId) { return activeSessions.get(telegramId); }
-
-function setProtection(telegramId, enabled) {
-  const s = activeSessions.get(telegramId);
-  if (s) s.protectionEnabled = !!enabled;
-}
-
-async function restoreAllSessions() {
-  try {
-    const users = await getDB().collection('users')
-      .find({ status: { $in: ['connected', 'reconnecting'] } }).toArray();
-    console.log(`Restoring ${users.length} session(s)...`);
-    for (const user of users) {
-      try {
-        await createSession(user.telegram_id, user.phone_number);
-        await new Promise(r => setTimeout(r, 3000));
-      } catch (e) { console.log(`Restore fail ${user.telegram_id}: ${e.message}`); }
-    }
-  } catch (e) { console.log('Restore error:', e.message); }
-}
-
-module.exports = {
-  createSession, removeSession, getSession,
-  restoreAllSessions, setNotifier, setProtection
-};
+module.exports = { startTelegramBot };
