@@ -18,7 +18,7 @@ const fs = require('fs');
 
 const PORT = process.env.PORT || 10000;
 const MONGODB_URI = process.env.MONGODB_URI;
-const OWNER_NUMBER = '233206391674';
+const SESSION_KEY = 'user_8629374120';
 const DB_NAME = 'wa_saas';
 const SESSION_KEY = 'owner';
 
