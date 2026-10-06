@@ -138,9 +138,10 @@ await notifyUser(telegramId,
     if (connection === 'connecting') session.status = 'connecting';
 
     if (connection === 'open') {
-      session.status = 'connected';
-      session.ownerNumber = String(phoneNumber).replace(/\D/g, '');
-      console.log(`✅ Connected: ${telegramId} (${session.ownerNumber})`);
+  if (session.hasSentConnectMsg) return;
+  session.hasSentConnectMsg = true;
+  session.status = 'connected';
+  session.ownerNumber = String(phoneNumber).replace(/\D/g, '');
 
       try {
         const groups = await sock.groupFetchAllParticipating();
