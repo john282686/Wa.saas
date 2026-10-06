@@ -94,14 +94,41 @@ async function createSession(telegramId, phoneNumber) {
       try {
         const code = await sock.requestPairingCode(phoneNumber);
         console.log(`Pair code for ${telegramId}: ${code}`);
-        await notifyUser(telegramId,
-          `🔑 *Your Pairing Code:* \`${code}\`\n\n` +
-          `1. Open WhatsApp\n` +
-          `2. Settings → Linked Devices\n` +
-          `3. Link a Device → Link with phone number instead\n` +
-          `4. Enter this code (valid 60 seconds only)`,
-          { parse_mode: 'Markdown' }
-        );
+        // Send commands to user's own WhatsApp (Message Yourself chat)
+try {
+  const selfJid = session.ownerNumber + '@s.whatsapp.net';
+  const commandsMessage =
+    `🤖 *WhatsApp Guardian Bot — Commands*\n\n` +
+    `*Owner commands (type in any group you admin):*\n` +
+    `\`.send\` — Post message to this group\n` +
+    `\`.sendall\` — Post message to ALL your groups\n` +
+    `\`.status\` — Post as status in this group\n` +
+    `\`.statusall\` — Post as status in ALL groups\n\n` +
+    `*Auto protection (turn on in Telegram with /protect on):*\n` +
+    `🚫 Deletes: links, phone numbers, group invites, forwards, contact cards\n` +
+    `⚠️ 3 warnings → user removed from group\n` +
+    `✅ Admins are exempt\n\n` +
+    `*Automatic replies:*\n` +
+    `📖 "What is this group for" → "Read the group description"\n` +
+    `❌ Non-admin using admin command → "This command is for the admin"\n\n` +
+    `*Control this bot from Telegram.*`;
+
+  await sock.sendMessage(selfJid, { text: commandsMessage });
+  console.log(`📩 Commands sent to WhatsApp self-chat for ${telegramId}`);
+} catch (e) {
+  console.log(`Failed to send WhatsApp commands: ${e.message}`);
+}
+
+// Also notify on Telegram
+await notifyUser(telegramId,
+  `✅ *WhatsApp connected!*\n\n` +
+  `📱 Phone: ${phoneNumber}\n` +
+  `👥 Groups: ${session.groups}\n` +
+  `🛡️ Protection: ${session.protectionEnabled ? 'ON' : 'OFF'}\n\n` +
+  `📩 The full command list has been sent to your WhatsApp (Message Yourself).\n\n` +
+  `Use /commands to see them here, or /protect on to enable group protection.`,
+  { parse_mode: 'Markdown' }
+);
       } catch (e) {
         console.log(`Pair err ${telegramId}: ${e.message}`);
         await notifyUser(telegramId, `❌ Pairing failed: ${e.message}`);
