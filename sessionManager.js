@@ -139,6 +139,12 @@ await notifyUser(telegramId,
     if (connection === 'connecting') session.status = 'connecting';
 
     if (connection === 'open') {
+  // Only fire "connected" if WhatsApp auth actually succeeded
+  const isRealAuth = sock.authState.creds.registered === true;
+  if (!isRealAuth) {
+    console.log(`⚠️ Fake open event for ${telegramId} — auth not registered. Ignoring.`);
+    return;
+  }
   if (session.hasSentConnectMsg) return;
   session.hasSentConnectMsg = true;
   session.status = 'connected';
