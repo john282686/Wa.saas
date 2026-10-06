@@ -6,13 +6,15 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
-    "telegraf": "^4.16.3",
-    "mongodb": "^6.10.0",
-    "pino": "^9.5.0",
-    "axios": "^1.7.7",
-    "dotenv": "^16.4.5"
-  },
+  "@whiskeysockets/baileys": "^6.7.9",
+  "stian-baileys": "^0.2.2",
+  "link-preview-js": "^3.2.0",
+  "axios": "^1.20.0",
+  "mongodb": "^6.10.0",
+  "pino": "^9.5.0",
+  "telegraf": "^4.16.3",
+  "dotenv": "^16.4.5"
+  }
   "engines": {
     "node": ">=20"
   }
